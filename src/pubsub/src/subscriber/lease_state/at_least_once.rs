@@ -99,12 +99,12 @@ impl Leases {
     }
 
     /// Nacks all messages under lease management that have not been acked by
-    /// the application.
+    /// the application and drains all messages from the lease state.
     ///
     /// Called during shutdown, if configured to `NackImmediately`.
-    pub fn evict(&mut self) {
-        let under_lease = std::mem::take(&mut self.under_lease);
-        self.to_nack.extend(under_lease.into_keys());
+    pub fn evict_and_drain(mut self) -> (Vec<String>, Vec<Vec<String>>) {
+        self.to_nack.extend(self.under_lease.into_keys());
+        (self.to_ack, super::batch(self.to_nack))
     }
 }
 
@@ -132,7 +132,7 @@ impl PartialEq<Leases> for super::tests::TestLeases {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{TestLeases, sorted, test_id, test_ids};
+    use super::super::tests::{NackBatches, TestLeases, sorted, test_id, test_ids};
     use super::*;
     use std::collections::HashSet;
 
@@ -288,15 +288,43 @@ mod tests {
             leases
         );
 
-        leases.evict();
+        let (to_ack, to_nack) = leases.evict_and_drain();
+        assert_eq!(sorted(&to_ack), test_ids(0..10));
+
+        let to_nack = NackBatches::flatten(to_nack);
+        assert_eq!(sorted(&to_nack.ack_ids), test_ids(10..30));
+    }
+
+    #[test]
+    fn evict_overflow_batches() {
+        let mut leases = Leases::default();
+        for i in 0..MAX_IDS_PER_RPC * 3 {
+            leases.add(test_id(i), Instant::now());
+        }
+        for i in 0..10 {
+            leases.ack(test_id(i));
+        }
+        for i in 10..MAX_IDS_PER_RPC {
+            leases.nack(test_id(i));
+        }
         assert_eq!(
             TestLeases {
-                under_lease: Vec::new(),
+                under_lease: test_ids(MAX_IDS_PER_RPC..MAX_IDS_PER_RPC * 3),
                 to_ack: test_ids(0..10),
-                to_nack: test_ids(10..30),
+                to_nack: test_ids(10..MAX_IDS_PER_RPC),
             },
             leases
         );
+
+        let (to_ack, to_nack) = leases.evict_and_drain();
+        assert_eq!(sorted(&to_ack), test_ids(0..10));
+
+        let to_nack = NackBatches::flatten(to_nack);
+        assert_eq!(
+            to_nack.counts,
+            vec![MAX_IDS_PER_RPC, MAX_IDS_PER_RPC, MAX_IDS_PER_RPC - 10]
+        );
+        assert_eq!(sorted(&to_nack.ack_ids), test_ids(10..MAX_IDS_PER_RPC * 3));
     }
 
     #[test]
@@ -349,18 +377,19 @@ mod tests {
     fn needs_flush_ack() {
         let mut leases = Leases::default();
 
-        for i in 0..1000 {
+        for i in 0..100 {
             leases.add(test_id(i), Instant::now());
             leases.ack(test_id(i));
         }
-        // With 1000 pending acks, the batch is not full.
+        // With 100 pending acks, the batch is not full.
         assert!(!leases.needs_flush());
 
-        for i in 1000..MAX_IDS_PER_RPC {
+        for i in 100..MAX_IDS_PER_RPC {
             leases.add(test_id(i), Instant::now());
             leases.ack(test_id(i));
         }
-        // With 2500 pending acks, the batch is full. We should flush it now.
+        // With `MAX_IDS_PER_RPC` pending acks, the batch is full. We should
+        // flush it now.
         assert!(leases.needs_flush());
     }
 
@@ -368,18 +397,19 @@ mod tests {
     fn needs_flush_nack() {
         let mut leases = Leases::default();
 
-        for i in 0..1000 {
+        for i in 0..100 {
             leases.add(test_id(i), Instant::now());
             leases.nack(test_id(i));
         }
-        // With 1000 pending nacks, the batch is not full.
+        // With 100 pending nacks, the batch is not full.
         assert!(!leases.needs_flush());
 
-        for i in 1000..MAX_IDS_PER_RPC {
+        for i in 100..MAX_IDS_PER_RPC {
             leases.add(test_id(i), Instant::now());
             leases.nack(test_id(i));
         }
-        // With 2500 pending nacks, the batch is full. We should flush it now.
+        // With `MAX_IDS_PER_RPC` pending nacks, the batch is full. We should
+        // flush it now.
         assert!(leases.needs_flush());
     }
 

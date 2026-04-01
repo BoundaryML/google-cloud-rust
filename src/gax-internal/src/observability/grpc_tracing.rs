@@ -338,7 +338,7 @@ fn record_status_from_headers(span: &tracing::Span, headers: &http::HeaderMap) {
     // Check for "OK" status (missing or "0") directly to avoid
     // the potential overhead of `tonic::Status::from_header_map` (parsing, decoding) in the success path.
     if headers.get("grpc-status").is_none_or(|v| v == "0") {
-        span.record(otel_attr::RPC_GRPC_STATUS_CODE, 0_i64);
+        span.record(RPC_RESPONSE_STATUS_CODE, "OK");
         return;
     }
 
@@ -346,7 +346,8 @@ fn record_status_from_headers(span: &tracing::Span, headers: &http::HeaderMap) {
     // include any error information inside the span (with API-level detail).
     if let Some(status) = tonic::Status::from_header_map(headers) {
         let code = status.code();
-        span.record(otel_attr::RPC_GRPC_STATUS_CODE, i32::from(code) as i64);
+        let code_name = google_cloud_gax::error::rpc::Code::from(code as i32).name();
+        span.record(RPC_RESPONSE_STATUS_CODE, code_name);
         if code != tonic::Code::Ok {
             span.record(OTEL_STATUS_CODE, otel_status_codes::ERROR);
             let gax_error = crate::grpc::from_status::to_gax_error(status);
@@ -375,9 +376,7 @@ fn create_grpc_span(
     attempt_count: Option<i64>,
     resource_name: Option<&str>,
 ) -> tracing::Span {
-    let (rpc_service, rpc_method) =
-        parse_method(uri.path()).unwrap_or_else(|_| ("unknown".to_string(), "unknown".to_string()));
-    let span_name = uri.path().trim_start_matches('/');
+    let rpc_method = uri.path().trim_start_matches('/');
 
     let (service, version, repo, artifact) = if let Some(info) = layer_inner.instrumentation {
         (
@@ -394,17 +393,15 @@ fn create_grpc_span(
 
     let span = tracing::info_span!(
         "grpc.request",
-        { OTEL_NAME } = span_name,
-        { otel_trace::RPC_SYSTEM } = attributes::RPC_SYSTEM_GRPC,
+        { OTEL_NAME } = rpc_method,
+        { RPC_SYSTEM_NAME } = attributes::RPC_SYSTEM_GRPC,
         { OTEL_KIND } = attributes::OTEL_KIND_CLIENT,
-        { otel_trace::RPC_SERVICE } = rpc_service,
         { otel_trace::RPC_METHOD } = rpc_method,
         { otel_trace::SERVER_ADDRESS } = layer_inner.server_address,
         { otel_trace::SERVER_PORT } = layer_inner.server_port,
         { otel_attr::URL_DOMAIN } = layer_inner.url_domain,
         // Standard attributes that will be populated later
-        { otel_attr::RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
-        { GRPC_STATUS } = tracing::field::Empty,
+        { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { OTEL_STATUS_CODE } = otel_status_codes::UNSET,
         { otel_trace::ERROR_TYPE } = tracing::field::Empty,
         // Client library metadata
@@ -413,20 +410,10 @@ fn create_grpc_span(
         { GCP_CLIENT_REPO } = repo,
         { GCP_CLIENT_ARTIFACT } = artifact,
         { GCP_GRPC_RESEND_COUNT } = resend_count,
-        { GCP_RESOURCE_NAME } = resource_name,
+        { GCP_RESOURCE_DESTINATION_ID } = resource_name,
     );
 
     span
-}
-
-fn parse_method(path: &str) -> Result<(String, String), &'static str> {
-    let path = path.trim_start_matches('/');
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() == 2 {
-        Ok((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        Err("invalid path format")
-    }
 }
 
 #[cfg(test)]
@@ -434,28 +421,6 @@ mod tests {
     use super::*;
     use google_cloud_test_utils::test_layer::{AttributeValue, TestLayer};
     use std::collections::HashMap;
-
-    #[test]
-    fn test_parse_method() {
-        assert_eq!(
-            parse_method("/google.pubsub.v1.Publisher/Publish"),
-            Ok((
-                "google.pubsub.v1.Publisher".to_string(),
-                "Publish".to_string()
-            ))
-        );
-        assert_eq!(
-            parse_method("google.pubsub.v1.Publisher/Publish"),
-            Ok((
-                "google.pubsub.v1.Publisher".to_string(),
-                "Publish".to_string()
-            ))
-        );
-        let result = parse_method("/invalid/path/format");
-        assert!(result.is_err(), "{result:?}");
-        let result = parse_method("invalid");
-        assert!(result.is_err(), "{result:?}");
-    }
 
     #[test]
     fn test_layer_new() {
@@ -512,12 +477,14 @@ mod tests {
         let expected_attributes: HashMap<String, AttributeValue> = [
             (OTEL_NAME, "google.pubsub.v1.Publisher/Publish".into()),
             (
-                otel_trace::RPC_SYSTEM,
+                RPC_SYSTEM_NAME,
                 crate::observability::attributes::RPC_SYSTEM_GRPC.into(),
             ),
             (OTEL_KIND, "Client".into()),
-            (otel_trace::RPC_SERVICE, "google.pubsub.v1.Publisher".into()),
-            (otel_trace::RPC_METHOD, "Publish".into()),
+            (
+                otel_trace::RPC_METHOD,
+                "google.pubsub.v1.Publisher/Publish".into(),
+            ),
             (otel_trace::SERVER_ADDRESS, "pubsub.googleapis.com".into()),
             (otel_trace::SERVER_PORT, 443_i64.into()),
             (otel_attr::URL_DOMAIN, "pubsub.googleapis.com".into()),
@@ -562,12 +529,14 @@ mod tests {
         let expected_attributes: HashMap<String, AttributeValue> = [
             (OTEL_NAME, "google.pubsub.v1.Publisher/Publish".into()),
             (
-                otel_trace::RPC_SYSTEM,
+                RPC_SYSTEM_NAME,
                 crate::observability::attributes::RPC_SYSTEM_GRPC.into(),
             ),
             (OTEL_KIND, "Client".into()),
-            (otel_trace::RPC_SERVICE, "google.pubsub.v1.Publisher".into()),
-            (otel_trace::RPC_METHOD, "Publish".into()),
+            (
+                otel_trace::RPC_METHOD,
+                "google.pubsub.v1.Publisher/Publish".into(),
+            ),
             (otel_trace::SERVER_ADDRESS, "pubsub.googleapis.com".into()),
             (otel_trace::SERVER_PORT, 443_i64.into()),
             (otel_attr::URL_DOMAIN, "pubsub.googleapis.com".into()),
@@ -606,17 +575,19 @@ mod tests {
         let expected_attributes: HashMap<String, AttributeValue> = [
             (OTEL_NAME, "google.pubsub.v1.Publisher/Publish".into()),
             (
-                otel_trace::RPC_SYSTEM,
+                RPC_SYSTEM_NAME,
                 crate::observability::attributes::RPC_SYSTEM_GRPC.into(),
             ),
             (OTEL_KIND, "Client".into()),
-            (otel_trace::RPC_SERVICE, "google.pubsub.v1.Publisher".into()),
-            (otel_trace::RPC_METHOD, "Publish".into()),
+            (
+                otel_trace::RPC_METHOD,
+                "google.pubsub.v1.Publisher/Publish".into(),
+            ),
             (otel_trace::SERVER_ADDRESS, "pubsub.googleapis.com".into()),
             (otel_trace::SERVER_PORT, 443_i64.into()),
             (otel_attr::URL_DOMAIN, "pubsub.googleapis.com".into()),
             (OTEL_STATUS_CODE, "UNSET".into()),
-            (GCP_RESOURCE_NAME, resource_name.into()),
+            (GCP_RESOURCE_DESTINATION_ID, resource_name.into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -630,7 +601,7 @@ mod tests {
         let guard = TestLayer::initialize();
         let span = tracing::info_span!(
             "test_span",
-            { otel_attr::RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
+            { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
             { OTEL_STATUS_CODE } = otel_status_codes::UNSET,
         );
         let _enter = span.enter();
@@ -644,8 +615,8 @@ mod tests {
         assert_eq!(captured.len(), 1);
         let span_data = &captured[0];
 
-        let status_code = span_data.attributes.get(otel_attr::RPC_GRPC_STATUS_CODE);
-        assert_eq!(status_code, Some(&AttributeValue::from(0_i64)));
+        let status_code = span_data.attributes.get(RPC_RESPONSE_STATUS_CODE);
+        assert_eq!(status_code, Some(&AttributeValue::from("OK")));
 
         // OTEL_STATUS_CODE should not be set to ERROR
         if let Some(val) = span_data.attributes.get(OTEL_STATUS_CODE) {
@@ -658,7 +629,7 @@ mod tests {
         let guard = TestLayer::initialize();
         let span = tracing::info_span!(
             "test_span",
-            { otel_attr::RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
+            { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
             { OTEL_STATUS_CODE } = otel_status_codes::UNSET,
             { otel_trace::ERROR_TYPE } = tracing::field::Empty,
         );
@@ -674,8 +645,8 @@ mod tests {
         assert_eq!(captured.len(), 1);
         let span_data = &captured[0];
 
-        let status_code = span_data.attributes.get(otel_attr::RPC_GRPC_STATUS_CODE);
-        assert_eq!(status_code, Some(&AttributeValue::from(3_i64)));
+        let status_code = span_data.attributes.get(RPC_RESPONSE_STATUS_CODE);
+        assert_eq!(status_code, Some(&AttributeValue::from("INVALID_ARGUMENT")));
 
         let otel_status = span_data.attributes.get(OTEL_STATUS_CODE);
         assert_eq!(otel_status, Some(&AttributeValue::from("ERROR")));

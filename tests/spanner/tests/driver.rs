@@ -59,6 +59,11 @@ mod spanner {
         )
         .await?;
 
+        integration_tests_spanner::read_write_transaction::concurrent_read_write_transaction_retries(
+            &db_client,
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -86,6 +91,22 @@ mod spanner {
         integration_tests_spanner::read::read_key_range(&db_client).await?;
         integration_tests_spanner::read::read_with_limit(&db_client).await?;
         integration_tests_spanner::read::read_with_index(&db_client).await?;
+        integration_tests_spanner::read::read_as_stream(&db_client).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_batch_read_only_transaction_tests() -> anyhow::Result<()> {
+        let db_client = match integration_tests_spanner::client::create_database_client().await {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        integration_tests_spanner::batch_read_only_transaction::partitioned_query(&db_client)
+            .await?;
+        integration_tests_spanner::batch_read_only_transaction::partitioned_read(&db_client)
+            .await?;
 
         Ok(())
     }

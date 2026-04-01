@@ -16,7 +16,7 @@ use crate::database_client::DatabaseClient;
 use crate::model::TransactionOptions;
 use crate::model::transaction_options::ReadOnly;
 use crate::precommit::PrecommitTokenTracker;
-use crate::result_set::ResultSet;
+use crate::result_set::{ResultSet, StreamOperation};
 use crate::statement::Statement;
 use crate::timestamp_bound::TimestampBound;
 
@@ -89,11 +89,12 @@ impl SingleUseReadOnlyTransactionBuilder {
             .set_single_use(TransactionOptions::default().set_read_only(read_only));
 
         SingleUseReadOnlyTransaction {
-            context: ReadContext::new(
-                self.client,
+            context: ReadContext {
+                client: self.client,
                 transaction_selector,
-                PrecommitTokenTracker::new_noop(),
-            ),
+                precommit_token_tracker: PrecommitTokenTracker::new_noop(),
+                transaction_tag: None,
+            },
         }
     }
 }
@@ -261,11 +262,12 @@ impl MultiUseReadOnlyTransactionBuilder {
 
         let transaction_selector = crate::model::TransactionSelector::default().set_id(response.id);
         Ok(MultiUseReadOnlyTransaction {
-            context: ReadContext::new(
-                self.client,
+            context: ReadContext {
+                client: self.client,
                 transaction_selector,
-                PrecommitTokenTracker::new_noop(),
-            ),
+                precommit_token_tracker: PrecommitTokenTracker::new_noop(),
+                transaction_tag: None,
+            },
             read_timestamp: response.read_timestamp,
         })
     }
@@ -294,7 +296,7 @@ impl MultiUseReadOnlyTransactionBuilder {
 /// ```
 #[derive(Debug)]
 pub struct MultiUseReadOnlyTransaction {
-    context: ReadContext,
+    pub(crate) context: ReadContext,
     pub(crate) read_timestamp: Option<wkt::Timestamp>,
 }
 
@@ -373,75 +375,80 @@ pub(crate) struct ReadContext {
     pub(crate) client: DatabaseClient,
     pub(crate) transaction_selector: crate::model::TransactionSelector,
     pub(crate) precommit_token_tracker: PrecommitTokenTracker,
+    pub(crate) transaction_tag: Option<String>,
 }
 
 impl ReadContext {
-    pub(crate) fn new(
-        client: DatabaseClient,
-        transaction_selector: crate::model::TransactionSelector,
-        precommit_token_tracker: PrecommitTokenTracker,
-    ) -> Self {
-        Self {
-            client,
-            transaction_selector,
-            precommit_token_tracker,
+    /// Amends the given request options with the transaction tag if present.
+    ///
+    /// This method returns the `RequestOptions` that should be used for the request.
+    /// If no `transaction_tag` has been set, the given `RequestOptions` is returned unchanged.
+    /// If a `transaction_tag` has been set, the given `RequestOptions` is modified to include the tag
+    /// (or a new `RequestOptions` is created if `None` was passed in).
+    pub(crate) fn amend_request_options(
+        &self,
+        mut options: Option<crate::model::RequestOptions>,
+    ) -> Option<crate::model::RequestOptions> {
+        if let Some(tag) = &self.transaction_tag {
+            options
+                .get_or_insert_with(crate::model::RequestOptions::default)
+                .transaction_tag = tag.clone();
         }
+        options
     }
 
     pub(crate) async fn execute_query<T: Into<Statement>>(
         &self,
         statement: T,
     ) -> crate::Result<ResultSet> {
-        let statement = statement.into();
-
-        let mut request = crate::model::ExecuteSqlRequest::default()
+        let mut request = statement
+            .into()
+            .into_request()
             .set_session(self.client.session.name.clone())
             .set_transaction(self.transaction_selector.clone());
-        request.params = statement.get_params();
-        request.param_types = statement.get_param_types();
-        request = request.set_sql(statement.sql);
+        request.request_options = self.amend_request_options(request.request_options);
 
         let stream = self
             .client
             .spanner
             // TODO(#4972): make request options configurable
-            .execute_streaming_sql(request, crate::RequestOptions::default())
+            .execute_streaming_sql(request.clone(), crate::RequestOptions::default())
             .send()
             .await?;
 
-        Ok(ResultSet::new(stream, self.precommit_token_tracker.clone()))
+        Ok(ResultSet::new(
+            stream,
+            self.precommit_token_tracker.clone(),
+            self.client.clone(),
+            StreamOperation::Query(request),
+        ))
     }
 
     pub(crate) async fn execute_read<T: Into<crate::read::ReadRequest>>(
         &self,
         read: T,
     ) -> crate::Result<ResultSet> {
-        let read = read.into();
-
-        let mut request = crate::model::ReadRequest::default()
+        let mut request = read
+            .into()
+            .into_request()
             .set_session(self.client.session.name.clone())
-            .set_transaction(self.transaction_selector.clone())
-            .set_table(read.table)
-            .set_columns(read.columns)
-            .set_key_set(read.keys.into_proto());
-
-        if let Some(index) = read.index {
-            request = request.set_index(index);
-        }
-
-        if let Some(limit) = read.limit {
-            request = request.set_limit(limit);
-        }
+            .set_transaction(self.transaction_selector.clone());
+        request.request_options = self.amend_request_options(request.request_options);
 
         let stream = self
             .client
             .spanner
             // TODO(#4972): make request options configurable
-            .streaming_read(request, crate::RequestOptions::default())
+            .streaming_read(request.clone(), crate::RequestOptions::default())
             .send()
             .await?;
 
-        Ok(ResultSet::new(stream, self.precommit_token_tracker.clone()))
+        Ok(ResultSet::new(
+            stream,
+            self.precommit_token_tracker.clone(),
+            self.client.clone(),
+            StreamOperation::Read(request),
+        ))
     }
 }
 

@@ -31,6 +31,7 @@ pub struct StatementBuilder {
     sql: String,
     params: BTreeMap<String, Value>,
     param_types: BTreeMap<String, Type>,
+    request_options: Option<crate::model::RequestOptions>,
 }
 
 impl StatementBuilder {
@@ -39,6 +40,7 @@ impl StatementBuilder {
             sql: sql.into(),
             params: BTreeMap::new(),
             param_types: BTreeMap::new(),
+            request_options: None,
         }
     }
 
@@ -70,12 +72,31 @@ impl StatementBuilder {
         self
     }
 
+    /// Sets the request tag to use for this statement.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::Statement;
+    /// let statement = Statement::builder("SELECT * FROM users")
+    ///     .with_request_tag("my-tag")
+    ///     .build();
+    /// ```
+    ///
+    /// See also: [Troubleshooting with tags](https://docs.cloud.google.com/spanner/docs/introspection/troubleshooting-with-tags)
+    pub fn with_request_tag(mut self, tag: impl Into<String>) -> Self {
+        self.request_options
+            .get_or_insert_with(crate::model::RequestOptions::default)
+            .request_tag = tag.into();
+        self
+    }
+
     /// Builds and returns the finalized Statement object.
     pub fn build(self) -> Statement {
         Statement {
             sql: self.sql,
             params: self.params,
             param_types: self.param_types,
+            request_options: self.request_options,
         }
     }
 }
@@ -108,6 +129,7 @@ pub struct Statement {
     pub sql: String,
     pub(crate) params: BTreeMap<String, Value>,
     pub(crate) param_types: BTreeMap<String, Type>,
+    pub(crate) request_options: Option<crate::model::RequestOptions>,
 }
 
 impl Statement {
@@ -116,24 +138,55 @@ impl Statement {
         StatementBuilder::new(sql)
     }
 
-    pub(crate) fn get_params(&self) -> Option<wkt::Struct> {
-        if self.params.is_empty() {
+    fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<wkt::Struct>,
+        std::collections::HashMap<String, crate::model::Type>,
+    ) {
+        let params: Option<wkt::Struct> = if self.params.is_empty() {
             None
         } else {
             Some(
                 self.params
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone().into_serde_value()))
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_serde_value()))
                     .collect(),
             )
-        }
+        };
+        let param_types: std::collections::HashMap<String, crate::model::Type> = self
+            .param_types
+            .into_iter()
+            .map(|(k, v)| (k, v.0))
+            .collect();
+        (self.sql, params, param_types)
     }
 
-    pub(crate) fn get_param_types(&self) -> std::collections::HashMap<String, crate::model::Type> {
-        self.param_types
-            .iter()
-            .map(|(k, v)| (k.clone(), v.0.clone()))
-            .collect()
+    pub(crate) fn into_request(self) -> crate::model::ExecuteSqlRequest {
+        let request_options = self.request_options.clone();
+        let (sql, params, param_types) = self.into_parts();
+        crate::model::ExecuteSqlRequest::default()
+            .set_sql(sql)
+            .set_or_clear_params(params)
+            .set_param_types(param_types)
+            .set_or_clear_request_options(request_options)
+    }
+
+    pub(crate) fn into_batch_statement(self) -> crate::model::execute_batch_dml_request::Statement {
+        let (sql, params, param_types) = self.into_parts();
+        crate::model::execute_batch_dml_request::Statement::default()
+            .set_sql(sql)
+            .set_or_clear_params(params)
+            .set_param_types(param_types)
+    }
+
+    pub(crate) fn into_partition_query_request(self) -> crate::model::PartitionQueryRequest {
+        let (sql, params, param_types) = self.into_parts();
+        crate::model::PartitionQueryRequest::default()
+            .set_sql(sql)
+            .set_or_clear_params(params)
+            .set_param_types(param_types)
     }
 }
 
@@ -174,6 +227,7 @@ mod tests {
         assert_eq!(stmt.sql, "SELECT * FROM users WHERE age > @age");
         assert_eq!(stmt.param_types.len(), 0);
         assert_eq!(stmt.params.len(), 1);
+        assert_eq!(stmt.request_options, None);
 
         let val = stmt.params.get("age").unwrap();
         assert_eq!(val.as_string(), "21");
@@ -212,10 +266,12 @@ mod tests {
         let stmt_string: Statement = "SELECT 1".to_string().into();
         assert_eq!(stmt_str.sql, "SELECT 1");
         assert_eq!(stmt_string.sql, "SELECT 1");
-        assert!(stmt_str.get_params().is_none());
-        assert!(stmt_string.get_params().is_none());
-        assert!(stmt_str.get_param_types().is_empty());
-        assert!(stmt_string.get_param_types().is_empty());
+        assert!(stmt_str.params.is_empty());
+        assert!(stmt_string.params.is_empty());
+        assert!(stmt_str.param_types.is_empty());
+        assert!(stmt_string.param_types.is_empty());
+        assert!(stmt_str.request_options.is_none());
+        assert!(stmt_string.request_options.is_none());
     }
 
     #[test]
@@ -235,22 +291,37 @@ mod tests {
     }
 
     #[test]
-    fn test_get_params_and_types() {
+    fn test_into_request() {
         use crate::types;
         let stmt = Statement::builder("SELECT * FROM users WHERE age > @age AND role = @role")
             .add_param("age", &21)
             .add_typed_param("role", &"admin", types::string())
             .build();
 
-        // Test get_params mapped to Option<wkt::Struct>
-        let params = stmt.get_params().unwrap();
+        let req = stmt.into_request();
+
+        let params = req
+            .params
+            .expect("ExecuteSqlRequest parameters should be set after into_request conversion");
         assert_eq!(params.len(), 2);
         assert!(params.contains_key("age"));
         assert!(params.contains_key("role"));
 
-        // Test get_param_types mapped to HashMap<String, model::Type>
-        let param_types = stmt.get_param_types();
+        let param_types = req.param_types;
         assert_eq!(param_types.len(), 1);
         assert!(param_types.contains_key("role"));
+    }
+
+    #[test]
+    fn with_request_tag() {
+        let stmt = Statement::builder("SELECT * FROM users")
+            .with_request_tag("tag1")
+            .build();
+        assert_eq!(
+            stmt.request_options
+                .expect("request options missing")
+                .request_tag,
+            "tag1"
+        );
     }
 }

@@ -28,11 +28,19 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, Interval, interval_at};
 use tokio_util::task::TaskTracker;
 
-// An ack ID is less than 200 bytes. The limit for a request is 512kB. It should
-// be safe to fit 2500 Ack IDs in a single RPC.
+// Request sizes are limited to 512kB. 500 bytes is a conservative upper limit
+// on the size of an ack ID. We can safely fit 1000 ack IDs into a request.
 //
 // https://docs.cloud.google.com/pubsub/quotas
-const MAX_IDS_PER_RPC: usize = 2500;
+const MAX_IDS_PER_RPC: usize = 1000;
+
+// Helper function to chunk ack ids into chunks of MAX_IDS_PER_RPC.
+fn batch(ack_ids: Vec<String>) -> Vec<Vec<String>> {
+    ack_ids
+        .chunks(MAX_IDS_PER_RPC)
+        .map(|c| c.to_vec())
+        .collect()
+}
 
 pub(super) struct LeaseOptions {
     /// How often we flush acks/nacks
@@ -257,32 +265,28 @@ where
     /// Shutdown the leaser
     ///
     /// This flushes all pending acks and nacks all other messages.
-    pub(super) async fn shutdown(mut self) {
+    pub(super) async fn shutdown(self) {
         // Note that if `WaitForProcessing` was selected by the application,
         // there are no messages under lease. They have all been processed.
-        self.leases.evict();
-        let (to_ack, to_nack) = self.leases.drain();
+        let (to_ack, to_nack) = self.leases.evict_and_drain();
         if !to_ack.is_empty() {
             let leaser = self.leaser.clone();
             self.pending_acks_nacks
                 .spawn(async move { leaser.ack(to_ack).await });
         }
-        if !to_nack.is_empty() {
-            // TODO(#4847) - this nack needs to be broken into batches.
+        for to_nack in to_nack {
             let leaser = self.leaser.clone();
             self.pending_acks_nacks
                 .spawn(async move { leaser.nack(to_nack).await });
         }
 
         // TODO(#5109) - evicting exactly-once leases is ok, but not ideal.
-        self.eo_leases.evict();
         // Currently, evict returns NACK_SHUTDOWN_ERROR for all exactly once
         // leases. This includes the to_ack leases. Specifically,
         // the leases that have been acknowledged by the application but not yet
         // flushed. Therefore, we do not need to flush those leases.
-        let (_, to_nack) = self.eo_leases.drain();
-        if !to_nack.is_empty() {
-            // TODO(#4847) - this nack needs to be broken into batches.
+        let (_, to_nack) = self.eo_leases.evict_and_drain();
+        for to_nack in to_nack {
             let leaser = self.leaser.clone();
             self.pending_acks_nacks
                 .spawn(async move { leaser.nack(to_nack).await });
@@ -320,6 +324,20 @@ pub(super) mod tests {
         pub(super) under_lease: Vec<String>,
         pub(super) to_ack: Vec<String>,
         pub(super) to_nack: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct NackBatches {
+        pub(super) counts: Vec<i32>,
+        pub(super) ack_ids: Vec<String>,
+    }
+
+    impl NackBatches {
+        pub(super) fn flatten(to_nack: Vec<Vec<String>>) -> Self {
+            let counts = to_nack.iter().map(|v| v.len() as i32).collect();
+            let ack_ids = to_nack.into_iter().flatten().collect();
+            Self { counts, ack_ids }
+        }
     }
 
     pub(in super::super) fn test_id(v: i32) -> String {

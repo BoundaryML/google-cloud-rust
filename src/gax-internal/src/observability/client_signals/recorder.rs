@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::observability::attributes::RPC_SYSTEM_HTTP;
+use crate::observability::attributes::{GCP_CLIENT_REPO_GOOGLEAPIS, RPC_SYSTEM_HTTP};
+#[cfg(feature = "_internal-http-client")]
+use crate::observability::http_tracing::sanitize_url;
 use crate::options::InstrumentationClientInfo;
 #[cfg(feature = "_internal-http-client")]
 use google_cloud_gax::error::Error;
+use http::Uri;
 use reqwest::Method;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::time::Instant;
+
+const HTTPS_PORT: u16 = 443;
 
 tokio::task_local! {
     static RECORDER: RequestRecorder;
@@ -149,6 +155,7 @@ impl RequestRecorder {
         guard.rpc_method = attributes.rpc_method;
         guard.url_template = attributes.url_template;
         guard.resource_name = attributes.resource_name;
+        guard.rpc_system = attributes.rpc_system;
     }
 
     /// Call before issuing a HTTP request to capture its data.
@@ -157,11 +164,11 @@ impl RequestRecorder {
         let mut guard = self.inner.lock().expect("never poisoned");
         let snapshot = TransportSnapshot {
             start: Instant::now(),
-            server_address: None,
+            network_peer_address: None,
             rpc_system: Some(RPC_SYSTEM_HTTP),
             http_method: Some(request.method().clone()),
             http_status_code: None,
-            url: Some(request.url().to_string()),
+            url: Some(sanitize_url(request.url()).to_string()),
         };
         guard.transport_snapshot = Some(snapshot);
     }
@@ -175,7 +182,7 @@ impl RequestRecorder {
         let mut guard = self.inner.lock().expect("never poisoned");
         guard.attempt_count += 1;
         if let Some(s) = guard.transport_snapshot.as_mut() {
-            s.server_address = response.remote_addr();
+            s.network_peer_address = response.remote_addr();
             s.http_status_code = Some(response.status().as_u16());
         }
     }
@@ -207,6 +214,7 @@ pub struct ClientRequestAttributes {
     pub rpc_method: Option<&'static str>,
     pub url_template: Option<&'static str>,
     pub resource_name: Option<String>,
+    pub rpc_system: Option<&'static str>,
 }
 
 impl ClientRequestAttributes {
@@ -224,6 +232,11 @@ impl ClientRequestAttributes {
         self.resource_name = Some(v);
         self
     }
+
+    pub fn set_rpc_system(mut self, v: &'static str) -> Self {
+        self.rpc_system = Some(v);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,6 +248,7 @@ pub struct ClientSnapshot {
     url_template: Option<&'static str>,
     resource_name: Option<String>,
     attempt_count: u32,
+    rpc_system: Option<&'static str>,
     transport_snapshot: Option<TransportSnapshot>,
 }
 
@@ -248,8 +262,18 @@ impl ClientSnapshot {
             url_template: None,
             resource_name: None,
             attempt_count: 0_u32,
+            rpc_system: None,
             transport_snapshot: None,
         }
+    }
+
+    /// Returns the client request duration.
+    ///
+    /// This measures the time since the instance was created. Client libraries should initialize an
+    /// instance at the beginning of the request, before any RPCs or attempts to create or fetch
+    /// authentication tokens.
+    pub fn client_duration(&self) -> Duration {
+        self.start.elapsed()
     }
 
     /// Returns the default host (e.g. `storage.googleapis.com`).
@@ -259,33 +283,71 @@ impl ClientSnapshot {
         self.info.default_host
     }
 
+    /// Returns the service name (e.g. `storage`).
+    ///
+    /// Use with the "gcp.client.service" attribute.
+    pub fn service_name(&self) -> &'static str {
+        self.info.service_name
+    }
+
+    /// Returns the service version (e.g. `1.2.3`).
+    ///
+    /// Use with the "gcp.client.version" attribute.
+    pub fn client_version(&self) -> &'static str {
+        self.info.client_version
+    }
+
+    /// Returns the GitHub repository.
+    ///
+    /// Use with the "gcp.client.repo" attribute.
+    pub fn client_repo(&self) -> &'static str {
+        GCP_CLIENT_REPO_GOOGLEAPIS
+    }
+
+    /// Returns the Rust crate.
+    ///
+    /// Use as instrumentation name, and with the "gcp.client.artifact" attribute.
+    pub fn client_artifact(&self) -> &'static str {
+        self.info.client_artifact
+    }
+
     /// Returns the RPC system (HTTP or gRPC) used in the last low-level request.
     ///
     /// Use with the "rpc.system.name" attribute.
     pub fn rpc_system(&self) -> Option<&'static str> {
-        self.transport_snapshot.as_ref().and_then(|s| s.rpc_system)
+        self.rpc_system
+            .or_else(|| self.transport_snapshot.as_ref().and_then(|s| s.rpc_system))
     }
 
     /// Returns the server address used in the last low-level request.
     ///
     /// If no address is known, use the target address from `info.default_host`.
+    ///
+    /// Use with the "server.address" attribute.
     pub fn server_address(&self) -> String {
-        self.transport_snapshot
-            .as_ref()
-            .and_then(|s| s.server_address)
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| self.info.default_host.to_string())
+        if let Some(uri) = self.sanitized_url().and_then(|u| u.parse::<Uri>().ok()) {
+            if let Some(host) = uri.host() {
+                return host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string();
+            }
+        }
+        self.info.default_host.to_string()
     }
 
     /// Returns the server port used in the last low-level request.
     ///
     /// If no port is known, use the port implied by `info.default_host`.
+    ///
+    /// Use with the "server.port" attribute after casting to `i64`.
     pub fn server_port(&self) -> u16 {
-        self.transport_snapshot
-            .as_ref()
-            .and_then(|s| s.server_address)
-            .map(|a| a.port())
-            .unwrap_or(443)
+        if let Some(uri) = self.sanitized_url().and_then(|u| u.parse::<Uri>().ok()) {
+            if let Some(host) = uri.authority().and_then(|a| a.port_u16()) {
+                return host;
+            }
+        }
+        HTTPS_PORT
     }
 
     /// Returns the URL template (e.g. "/v1/storage/b/{bucket}") used in the last low-level request.
@@ -293,6 +355,13 @@ impl ClientSnapshot {
     /// Use with the "url.template" attribute.
     pub fn url_template(&self) -> Option<&'static str> {
         self.url_template
+    }
+
+    /// Returns the resource name (e.g. "//storage.googleapis.com/projects/_/buckets/my-bucket").
+    ///
+    /// Use with the "gcp.resource.destination.id" attribute.
+    pub fn resource_name(&self) -> Option<&str> {
+        self.resource_name.as_deref()
     }
 
     /// Returns the RPC method (e.g. "cloud.google.secretmanager.v1.SecretManager/GetSecret") used in the request.
@@ -306,22 +375,66 @@ impl ClientSnapshot {
     ///
     /// Note that this may not be populated for gRPC requests.
     ///
-    /// Use with the "rpc.method" attribute.
+    /// Use with the "http.response.status_code" attribute after casting to `i64`.
     pub fn http_status_code(&self) -> Option<u16> {
         self.transport_snapshot
             .as_ref()
             .and_then(|s| s.http_status_code)
     }
 
-    /// Returns the full URL used in the last request.
+    /// Returns the HTTP method (e.g. POST) used in the last request.
     ///
     /// Note that this may not be populated for gRPC requests.
     ///
-    /// Use with the "rpc.method" attribute.
-    pub fn url(&self) -> Option<&str> {
+    /// Use with the "http.request.method" attribute.
+    pub fn http_method(&self) -> Option<&str> {
+        self.transport_snapshot
+            .as_ref()
+            .and_then(|s| s.http_method.as_ref().map(|m| m.as_str()))
+    }
+
+    /// Returns the "resend count" of the last request, if it was a retry.
+    ///
+    /// The resend count of the initial attempt is `None`, and starts at 1 for each retry attempt
+    /// made.
+    ///
+    /// Use with the "http.request.resend_count" attribute after casting to `i64`.
+    pub fn http_resend_count(&self) -> Option<u32> {
+        if self.attempt_count <= 1 {
+            return None;
+        }
+        Some(self.attempt_count - 1)
+    }
+
+    /// Returns the sanitized (but otherwise full) URL used in the last request.
+    ///
+    /// Note that this may not be populated for gRPC requests.
+    ///
+    /// Use with the "url.full" attribute.
+    pub fn sanitized_url(&self) -> Option<&str> {
         self.transport_snapshot
             .as_ref()
             .and_then(|s| s.url.as_deref())
+    }
+
+    /// Returns the network peer address.
+    ///
+    /// Use with the "network.peer.address" attribute.
+    pub fn network_peer_address(&self) -> Option<String> {
+        self.transport_snapshot
+            .as_ref()
+            .and_then(|s| s.network_peer_address)
+            .map(|a| a.ip().to_string())
+    }
+
+    /// Returns the network peer port.
+    ///
+    /// Use with the "network.peer.port" attribute.
+    pub fn network_peer_port(&self) -> Option<i64> {
+        self.transport_snapshot
+            .as_ref()
+            .and_then(|s| s.network_peer_address)
+            .map(|a| a.port() as i64)
     }
 }
 
@@ -329,7 +442,7 @@ impl ClientSnapshot {
 #[non_exhaustive]
 pub struct TransportSnapshot {
     start: Instant,
-    server_address: Option<SocketAddr>,
+    network_peer_address: Option<SocketAddr>,
     rpc_system: Option<&'static str>,
     http_method: Option<Method>,
     http_status_code: Option<u16>,
@@ -343,9 +456,11 @@ mod tests {
     use httptest::matchers::request::method_path;
     use httptest::responders::status_code;
     use httptest::{Expectation, Server};
+    use pretty_assertions::assert_eq;
 
     const TEST_METHOD_NAME: &str = "google.test.v1.Service/SomeMethod";
     const TEST_PATH_TEMPLATE: &str = "/v42/{parent}";
+    const TEST_RESOURCE_NAME: &str = "//test.googleapis.com/test-only";
     const STORAGE_PATH_TEMPLATE: &str = "/v1/storage/b/{bucket}/o/{object}";
 
     async fn simulate_http_client_gaxi(url: &str) -> Result<String, Error> {
@@ -373,7 +488,7 @@ mod tests {
             ClientRequestAttributes::default()
                 .set_rpc_method(TEST_METHOD_NAME)
                 .set_url_template(TEST_PATH_TEMPLATE)
-                .set_resource_name("//test.googleapis.com/test-only".to_string()),
+                .set_resource_name(TEST_RESOURCE_NAME.to_string()),
         );
         simulate_http_client_gaxi(url).await
     }
@@ -404,8 +519,9 @@ mod tests {
         assert_eq!(snap.start, Instant::now(), "{snap:?}");
         assert_eq!(snap.rpc_method(), Some(TEST_METHOD_NAME), "{snap:?}");
         assert_eq!(snap.url_template(), Some(TEST_PATH_TEMPLATE), "{snap:?}");
+        assert_eq!(snap.resource_name(), Some(TEST_RESOURCE_NAME), "{snap:?}");
         assert_eq!(snap.rpc_system(), Some("http"), "{snap:?}");
-        assert_eq!(snap.url(), Some(url.as_str()), "{snap:?}");
+        assert_eq!(snap.sanitized_url(), Some(url.as_str()), "{snap:?}");
 
         assert_eq!(snap.attempt_count, 1, "{snap:?}");
         assert_eq!(snap.http_status_code(), Some(404), "{snap:?}");
@@ -432,15 +548,37 @@ mod tests {
         assert_eq!(snap.rpc_method(), Some(TEST_METHOD_NAME), "{snap:?}");
         assert_eq!(snap.url_template(), Some(TEST_PATH_TEMPLATE), "{snap:?}");
         assert_eq!(snap.rpc_system(), Some("http"), "{snap:?}");
-        assert_eq!(snap.url(), Some(BAD_URL), "{snap:?}");
+        assert_eq!(snap.sanitized_url(), Some(BAD_URL), "{snap:?}");
 
         assert_eq!(snap.attempt_count, 1, "{snap:?}");
         assert!(snap.http_status_code().is_none(), "{snap:?}");
-        assert_eq!(
-            snap.server_address().as_str(),
-            TEST_INFO.default_host,
-            "{snap:?}"
-        );
+        assert_eq!(snap.server_address().as_str(), "127.0.0.1", "{snap:?}");
+        assert_eq!(snap.server_port(), 1, "{snap:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_bad_url() {
+        const BAD_URL: &str = "bad-url";
+
+        let recorder = RequestRecorder::new(TEST_INFO);
+        let scoped = recorder.clone();
+        // Normally this code would be in the `tracing.rs` layer. Inline it here so we can examine the
+        // effects on the `RequestRecorder`.
+        let got = scoped
+            .scope(simulate_http_client_transport_layer(BAD_URL))
+            .await;
+        assert!(matches!(got, Err(ref e) if e.is_io()), "{got:?}");
+        let snap = recorder.client_snapshot();
+
+        assert_eq!(snap.start, Instant::now(), "{snap:?}");
+        assert_eq!(snap.rpc_method(), Some(TEST_METHOD_NAME), "{snap:?}");
+        assert_eq!(snap.url_template(), Some(TEST_PATH_TEMPLATE), "{snap:?}");
+        assert!(snap.rpc_system().is_none(), "{snap:?}");
+        assert!(snap.sanitized_url().is_none(), "{snap:?}");
+
+        assert_eq!(snap.attempt_count, 1, "{snap:?}");
+        assert!(snap.http_status_code().is_none(), "{snap:?}");
+        assert_eq!(snap.server_address().as_str(), "example.com", "{snap:?}");
         assert_eq!(snap.server_port(), 443, "{snap:?}");
     }
 
@@ -485,11 +623,70 @@ mod tests {
         assert!(snap.rpc_method().is_none(), "{snap:?}");
         assert_eq!(snap.url_template(), Some(STORAGE_PATH_TEMPLATE), "{snap:?}");
         assert_eq!(snap.rpc_system(), Some("http"), "{snap:?}");
-        assert_eq!(snap.url(), Some(url.as_str()), "{snap:?}");
+        assert_eq!(snap.sanitized_url(), Some(url.as_str()), "{snap:?}");
         assert_eq!(snap.attempt_count, 1, "{snap:?}");
         assert_eq!(snap.http_status_code(), Some(404), "{snap:?}");
         let addr = server.addr();
         assert_eq!(snap.server_address(), addr.ip().to_string(), "{snap:?}");
         assert_eq!(snap.server_port(), addr.port(), "{snap:?}");
+    }
+
+    #[test]
+    fn url_is_sanitized() -> anyhow::Result<()> {
+        const RAW_URL: &str = "https://127.0.0.1:1/v42/unused?Signature=ABC&upload_id=123";
+        const WANT_URL: &str =
+            "https://127.0.0.1:1/v42/unused?Signature=REDACTED&upload_id=REDACTED";
+
+        let url = reqwest::Url::parse(RAW_URL)?;
+        let request = reqwest::Request::new(reqwest::Method::GET, url);
+        let recorder = RequestRecorder::new(TEST_INFO);
+        recorder.on_http_request(&request);
+        let snap = recorder.client_snapshot();
+        assert_eq!(snap.sanitized_url(), Some(WANT_URL), "{snap:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn address_sources() -> anyhow::Result<()> {
+        const RAW_URL: &str = "https://127.0.0.1:1/v42/unused";
+
+        let recorder = RequestRecorder::new(TEST_INFO);
+        let snap = recorder.client_snapshot();
+        assert_eq!(snap.server_address(), TEST_INFO.default_host, "{snap:?}");
+        assert_eq!(snap.server_port(), HTTPS_PORT, "{snap:?}");
+
+        let url = reqwest::Url::parse(RAW_URL)?;
+        let request = reqwest::Request::new(reqwest::Method::GET, url);
+        recorder.on_http_request(&request);
+        let snap = recorder.client_snapshot();
+        assert_eq!(snap.server_address(), "127.0.0.1", "{snap:?}");
+        assert_eq!(snap.server_port(), 1, "{snap:?}");
+
+        {
+            let mut guard = recorder.inner.lock().expect("never poisoned");
+            let s = guard.transport_snapshot.as_mut().expect("already set");
+            s.network_peer_address = Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::new(127, 0, 0, 234),
+                234,
+            )));
+        }
+        let snap = recorder.client_snapshot();
+        assert_eq!(
+            snap.network_peer_address(),
+            Some("127.0.0.234".to_string()),
+            "{snap:?}"
+        );
+        assert_eq!(snap.network_peer_port(), Some(234), "{snap:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_duration() {
+        const DURATION: Duration = Duration::from_millis(123456);
+        let recorder = RequestRecorder::new(TEST_INFO);
+        tokio::time::sleep(DURATION).await;
+        let snap = recorder.client_snapshot();
+        assert_eq!(snap.client_duration(), DURATION, "{snap:?}");
     }
 }

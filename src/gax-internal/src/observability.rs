@@ -30,24 +30,23 @@ pub mod attributes;
 mod errors;
 
 #[cfg(all(google_cloud_unstable_tracing, feature = "_internal-http-client"))]
-mod http_tracing;
+pub(crate) mod http_tracing;
 
 #[cfg(all(google_cloud_unstable_tracing, feature = "_internal-http-client"))]
 pub(crate) use http_tracing::{ResultExt as HttpResultExt, create_http_attempt_span};
 
 #[cfg(all(google_cloud_unstable_tracing, feature = "_internal-grpc-client"))]
-pub mod grpc_tracing;
+pub(crate) mod grpc_tracing;
 
 #[cfg(google_cloud_unstable_tracing)]
 mod client_signals;
 
 #[cfg(google_cloud_unstable_tracing)]
 pub use client_signals::{
-    ClientRequestAttributes, ClientSignalsExt, DurationMetric, RequestRecorder, RequestStart,
+    ClientRequestAttributes, DurationMetric, RequestRecorder, WithClientLogging, WithClientMetric,
+    WithClientSpan,
 };
 
 #[cfg(google_cloud_unstable_tracing)]
-mod client_tracing;
-
-#[cfg(google_cloud_unstable_tracing)]
-pub use client_tracing::ResultExt;
+#[doc(hidden)]
+pub use attributes::{GCP_CLIENT_REPO_GOOGLEAPIS, SCHEMA_URL_VALUE};
