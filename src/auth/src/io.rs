@@ -22,6 +22,11 @@ use std::future::Future;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 
+// Re-export types from the `http` crate that appear in our public API
+// (e.g. `HttpResponse::status` and `HttpResponse::headers`), so that
+// provider implementors don't need to depend on a matching `http` version.
+pub use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+
 /// Abstracts environment variable reads.
 ///
 /// The default implementation delegates to `std::env::var`.
